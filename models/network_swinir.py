@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+# 修复警告：使用timm.layers替代timm.models.layers
+try:
+    from timm.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    # 兼容旧版本timm
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 
 class Mlp(nn.Module):
@@ -92,7 +97,8 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        # 修复警告：添加indexing参数
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -649,6 +655,7 @@ class SwinIR(nn.Module):
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, upscale=2, img_range=1., upsampler='', resi_connection='1conv',
+                 residual_scale=1.0, shallow_residual_scale=1.0,
                  **kwargs):
         super(SwinIR, self).__init__()
         num_in_ch = in_chans
@@ -663,6 +670,13 @@ class SwinIR(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         self.window_size = window_size
+
+        # Residual scale parameters for controlling skip connections
+        # REDESIGNED: Swapped semantics to match intuition
+        # shallow_residual_scale: Controls image-level residual (x) - shallow layer, should be SMALLER
+        # residual_scale: Controls feature-level residual (x_first) - deep features, can be LARGER
+        self.residual_scale = residual_scale  # For feature-level residual (x_first in formula 4)
+        self.shallow_residual_scale = shallow_residual_scale  # For image-level residual (x in formula 5)
 
         #####################################################################################################
         ################################### 1, shallow feature extraction ###################################
@@ -812,18 +826,18 @@ class SwinIR(nn.Module):
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x)) + self.residual_scale * x
             x = self.conv_before_upsample(x)
             x = self.conv_last(self.upsample(x))
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x)) + self.residual_scale * x
             x = self.upsample(x)
         elif self.upsampler == 'nearest+conv':
             # for real-world SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_after_body(self.forward_features(x)) + self.residual_scale * x
             x = self.conv_before_upsample(x)
             x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
             if self.upscale == 4:
@@ -831,9 +845,15 @@ class SwinIR(nn.Module):
             x = self.conv_last(self.lrelu(self.conv_hr(x)))
         else:
             # for image denoising and JPEG compression artifact reduction
+            # ⭐ YOUR TASK USES THIS BRANCH ⭐
             x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            x = x + self.conv_last(res)
+            # REDESIGNED Formula 4: Feature-level residual with residual_scale controlling x_first (old feature)
+            # residual_scale controls how much of the old feature (x_first) to keep
+            res = self.conv_after_body(self.forward_features(x_first)) + self.residual_scale * x_first
+            # REDESIGNED Formula 5: Image-level residual with shallow_residual_scale controlling x (original input)
+            # shallow_residual_scale controls how much of the original input (x) to keep
+            # Now both scales act on the "old/input" consistently, not on the "new/output"
+            x = self.conv_last(res) + self.shallow_residual_scale * x
 
         x = x / self.img_range + self.mean
 

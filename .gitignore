@@ -1,0 +1,12 @@
+# General
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+
+# Project specific
+experiments/
+results/
+*.pth
+*.pt
